@@ -1,0 +1,153 @@
+---
+stages:
+- name: BUILD
+  inputs:
+  - type: git
+    branch: master
+  triggers:
+  - type: commit
+  jobs:
+  - name: Cloudfoundry Build
+    type: builder
+    artifact_dir: ''
+- name: DEPLOY
+  inputs:
+  - type: job
+    stage: BUILD
+    job: Cloudfoundry Build
+  triggers:
+  - type: stage
+  properties:
+  - name: ROUTE_HOSTNAME
+    value: ${CF_APP}
+    type: text
+  - name: ROUTE_DOMAIN
+    value: 'mybluemix.net'
+    type: text
+  - name: TEST_RESULT_FOR_AD
+    value: ''
+    type: text
+  - name: GROUP_SIZE
+    value: '2'
+    type: text
+  - name: NAME
+    value: ''
+    type: text
+  jobs:
+  - name: Deploy Single Instance
+    type: deployer
+    target:
+      region_id: ${BLUEMIX_REGION_ID}
+      organization: ${CF_ORGANIZATION}
+      space: ${CF_SPACE}
+      application: ${CF_APP}
+    script: |-
+       #!/bin/bash
+       export NAME="${CF_APP}_${BUILD_NUMBER}"
+       cf push "${NAME}" --no-route -i 1
+       export ROUTE_HOSTNAME=${CF_APP}
+  - name: Begin Active Deploy
+    type: deployer
+    extension_id: ibm.devops.services.pipeline.devops.ad_start
+    target:
+      url: ${CF_TARGET_URL}
+      organization: ${CF_ORGANIZATION}
+      space: ${CF_SPACE}
+    DEPLOYMENT_METHOD: Red Black
+    RAMPDOWN_DURATION: 1m
+    RAMPUP_DURATION: 1m
+    COMMAND: |-
+      #!/bin/bash
+      #
+      # The following code uses the Active Deploy service to update your new application with zero downtime.
+      # The code used is available at https://github.com/Osthanes/update_service
+      # and https://github.com/Osthanes/activedeploy_common.
+      #
+      # For details about how to set up the Active Deploy extension for the Delivery Pipeline, see
+      # https://console.ng.bluemix.net/docs/services/ActiveDeploy/updatingapps.html#adpipeline.
+      #
+      # Feel free to fork the code. After creating your fork, define the environment variable GIT_HOME to use the forked repositories with the
+      # format https://github.com/${GIT_HOME}/update_service and https://github.com/${GIT_HOME}/activedeploy_common.
+      #
+      # Make sure the following variables are defined as environment properties with no values:
+      # NAME: The name of your new application. This variable has to be exported in the first deploy job.
+      # TEST_RESULT_FOR_AD: Passes the results of the test phase to the Active Deploy - Complete job. Set this variable in the test job.
+      #
+      # The following variables may be defined as environment properties:
+      # GROUP_SIZE: The number of instances that are created during initial deployment. The default value is 1.
+      # CONCURRENT_VERSIONS: The number of application versions to keep at the end of deployment. The default value is 2.       
+      #
+      
+      source ${EXT_DIR}/git_util.sh
+      git_retry clone https://github.com/IBMActiveDeploy-Toolchain/update_service.git activedeploy
+      activedeploy/activedeploy_step_1.sh
+  - name: Test
+    type: tester
+    fail_stage: false
+    script: |-
+      #!/bin/bash
+
+      set +e
+
+      # Start by checking if a previous test failed. If so, quit now.
+      # Make sure exit code is 0 (success).
+      if [[ -n ${TEST_RESULT_FOR_AD} ]] && (( ${TEST_RESULT_FOR_AD} )); then
+          exit 0
+      fi
+
+      # invoke tests here
+
+      # Set TEST_RESULT_FOR_AD: 0 for successful tests, non-zero for failures
+      # 'exit' SHOULD NOT be used in this script after this point.
+
+      TEST_RESULT_FOR_AD=0
+      TEST_URL="${ROUTE_HOSTNAME}.${ROUTE_DOMAIN}"
+      echo "Using TEST_URL $TEST_URL"
+
+      STRING_TO_TEST_FOR="world"
+
+      for ((i=1; i<10; i++)); do
+         reply=$(wget -qO- https://${TEST_URL} | egrep "h1" | sed 's/<[\/]*h1>//g;s/^[[:blank:]]*//g;s/[[:blank:]]*$//g')
+         echo "Reply: '$reply'"
+         echo "Testing for '$STRING_TO_TEST_FOR' ..."
+         grep -qi "$STRING_TO_TEST_FOR" <<< "$reply" 
+         if (( $? )); then
+            TEST_RESULT_FOR_AD=1  
+            echo "FAILURE: String '$STRING_TO_TEST_FOR' not found"
+            break
+         else
+            echo "OK: String '$STRING_TO_TEST_FOR' found"
+         fi
+         sleep 5
+      done
+
+      export TEST_RESULT_FOR_AD
+      (( ! $TEST_RESULT_FOR_AD )) && echo "!!! Test finished successfully :-)" || echo "??? Test failed :-("  
+  - name: Complete Active Deploy
+    type: deployer
+    extension_id: ibm.devops.services.pipeline.devops.ad_finish
+    target:
+      url: ${CF_TARGET_URL}
+      organization: ${CF_ORGANIZATION}
+      space: ${CF_SPACE}
+    COMMAND: |-
+      #!/bin/bash
+      #
+      # The following code uses the Active Deploy service to update your new application with zero downtime.
+      # The code used is available at https://github.com/Osthanes/update_service
+      # and https://github.com/Osthanes/activedeploy_common.
+      #
+      # For details about how to set up the Active Deploy extension for the Delivery Pipeline, see
+      # https://console.ng.bluemix.net/docs/services/ActiveDeploy/updatingapps.html#adpipeline.
+      #
+      # Feel free to fork the code. After creating your fork, define the environment variable GIT_HOME to use the forked repositories with the
+      # format https://github.com/${GIT_HOME}/update_service and https://github.com/${GIT_HOME}/activedeploy_common.
+      #
+      source ${EXT_DIR}/git_util.sh
+      git_retry clone https://github.com/IBMActiveDeploy-Toolchain/update_service.git activedeploy
+      activedeploy/activedeploy_step_2.sh
+hooks:
+- enabled: true
+  label: null
+  ssl_enabled: false
+  url: https://devops-api.ng.bluemix.net/v1/messaging/webhook/publish
